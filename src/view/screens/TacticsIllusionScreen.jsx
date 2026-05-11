@@ -27,6 +27,56 @@ const ATTACK_PROFILES = {
   spell: { windupMs: 320, travelMs: 260, settleMs: 200, backstepDistance: 0.1, lungeDistance: 0.08, arcHeight: 1.6, accent: '#c084fc' },
 };
 
+const getUnitSelectionStroke = (team) => (team === 'enemy' ? '#ef4444' : '#fde047');
+
+const getCombatHoverPalette = (team = 'player') => (team === 'enemy'
+  ? {
+      fill: 'rgba(239,68,68,0.18)',
+      stroke: '#f87171',
+      main: '#ef4444',
+      side: '#b91c1c',
+      outline: '#fecaca',
+      glow: 'rgba(239,68,68,0.28)',
+    }
+  : {
+      fill: 'rgba(250,204,21,0.18)',
+      stroke: '#fde047',
+      main: '#facc15',
+      side: '#ca8a04',
+      outline: '#fef3c7',
+      glow: 'rgba(250,204,21,0.28)',
+    });
+
+const drawCombatPreviewArrow = (ctx, now, team) => {
+  const palette = getCombatHoverPalette(team);
+  const bounce = Math.sin(now / 180) * 2;
+
+  ctx.save();
+  ctx.translate(0, -50 + bounce);
+  ctx.shadowColor = palette.glow;
+  ctx.shadowBlur = 8;
+
+  ctx.fillStyle = palette.main;
+  ctx.beginPath();
+  ctx.moveTo(0, 10);
+  ctx.lineTo(5.5, -2);
+  ctx.lineTo(-5.5, -2);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = palette.outline;
+  ctx.lineWidth = 1;
+  ctx.globalAlpha = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, 10);
+  ctx.lineTo(5.5, -2);
+  ctx.lineTo(-5.5, -2);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+};
+
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
 const easeOutCubic = (value) => 1 - ((1 - value) ** 3);
@@ -96,6 +146,14 @@ const syncSelectedUnitFromUnits = (selectedUnit, units) => {
   }
 
   return units.find((unit) => unit.uid === selectedUnit.uid) ?? null;
+};
+
+const isWithinCombatBoundary = (cell, boundary) => {
+  if (!cell || !boundary) {
+    return false;
+  }
+
+  return cell.x >= boundary.minX && cell.x <= boundary.maxX && cell.y >= boundary.minY && cell.y <= boundary.maxY;
 };
 
 const createTimedTween = (from, to, duration = MOVE_TWEEN_DURATION, startedAt = performance.now()) => ({
@@ -257,6 +315,7 @@ export default function TacticsIllusionScreen() {
   const renderablesRef = useRef([]); 
   const motionTweensRef = useRef({});
   const combatEffectsRef = useRef([]);
+  const combatHoverCellRef = useRef(null);
   const combatBusyRef = useRef(false);
   const effectIdRef = useRef(0);
   const cameraTweenRef = useRef(null);
@@ -272,6 +331,7 @@ export default function TacticsIllusionScreen() {
 
   useEffect(() => {
     if (mode !== 'COMBAT') {
+      combatHoverCellRef.current = null;
       combatBusyRef.current = false;
       combatEffectsRef.current = [];
     }
@@ -300,6 +360,114 @@ export default function TacticsIllusionScreen() {
       boundary,
       worldSize: WORLD_SIZE,
     });
+  };
+
+  const getGridCellFromScreenPoint = (screenX, screenY, options = {}) => {
+    const { allowEntityFallback = false } = options;
+    const canvas = canvasRef.current;
+
+    if (!canvas) {
+      return null;
+    }
+
+    const rect = canvas.getBoundingClientRect();
+    const x = screenX - rect.left;
+    const y = screenY - rect.top;
+    const ctx = canvas.getContext('2d');
+    const { x: camX, y: camY, zoom } = cameraRef.current;
+    const cx = canvas.width / 2 + camX;
+    const cy = canvas.height / 2 + camY;
+    const renderables = renderablesRef.current;
+
+    for (let index = renderables.length - 1; index >= 0; index -= 1) {
+      const item = renderables[index];
+      if (item.type !== 'cell') {
+        continue;
+      }
+
+      const { x: gx, y: gy } = item;
+      const z0 = worldMap[gx][gy];
+      const z1 = worldMap[gx + 1][gy];
+      const z2 = worldMap[gx + 1][gy + 1];
+      const z3 = worldMap[gx][gy + 1];
+      const p0 = toIso(gx, gy, z0);
+      const p1 = toIso(gx + 1, gy, z1);
+      const p2 = toIso(gx + 1, gy + 1, z2);
+      const p3 = toIso(gx, gy + 1, z3);
+
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.beginPath();
+      ctx.moveTo(cx + p0.cx * zoom, cy + p0.cy * zoom);
+      ctx.lineTo(cx + p1.cx * zoom, cy + p1.cy * zoom);
+      ctx.lineTo(cx + p2.cx * zoom, cy + p2.cy * zoom);
+      ctx.lineTo(cx + p3.cx * zoom, cy + p3.cy * zoom);
+      ctx.closePath();
+      if (ctx.isPointInPath(x, y)) {
+        return { x: gx, y: gy };
+      }
+    }
+
+    if (!allowEntityFallback) {
+      return null;
+    }
+
+    let nearestCell = null;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+
+    for (let index = renderables.length - 1; index >= 0; index -= 1) {
+      const item = renderables[index];
+      let hitCell = null;
+      let hitX = 0;
+      let hitY = 0;
+      let hitRadius = 0;
+
+      if (item.type === 'player_leader') {
+        const z = getAnimatedCellZ(worldMap, item.displayPos.x, item.displayPos.y);
+        const pos = toIso(item.displayPos.x + 0.5, item.displayPos.y + 0.5, z);
+        hitX = cx + pos.cx * zoom;
+        hitY = cy + (pos.cy - 15) * zoom;
+        hitRadius = 40 * zoom;
+        hitCell = { x: stateRef.current.playerData.pos.x, y: stateRef.current.playerData.pos.y };
+      } else if (item.type === 'combat_unit') {
+        const z = getAnimatedCellZ(worldMap, item.displayPos.x, item.displayPos.y);
+        const pos = toIso(item.displayPos.x + 0.5, item.displayPos.y + 0.5, z);
+        hitX = cx + pos.cx * zoom;
+        hitY = cy + (pos.cy - 12) * zoom;
+        hitRadius = 40 * zoom;
+        hitCell = { x: item.unit.x, y: item.unit.y };
+      } else if (item.type === 'entity') {
+        const z = getCellZ(worldMap, item.ent.x, item.ent.y);
+        const pos = toIso(item.ent.x + 0.5, item.ent.y + 0.5, z);
+        hitX = cx + pos.cx * zoom;
+        hitY = cy + (pos.cy - 15) * zoom;
+        hitRadius = 35 * zoom;
+        hitCell = { x: item.ent.x, y: item.ent.y };
+      }
+
+      if (!hitCell) {
+        continue;
+      }
+
+      const distance = Math.hypot(x - hitX, y - hitY);
+      if (distance <= hitRadius && distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestCell = hitCell;
+      }
+    }
+
+    return nearestCell;
+  };
+
+  const updateCombatHoverFromScreenPoint = (screenX, screenY) => {
+    const st = stateRef.current;
+
+    if (st.mode !== 'COMBAT' || !st.combatState || combatBusyRef.current || st.combatState.isResolving) {
+      combatHoverCellRef.current = null;
+      return;
+    }
+
+    const hoveredCell = getGridCellFromScreenPoint(screenX, screenY, { allowEntityFallback: true });
+    combatHoverCellRef.current = isWithinCombatBoundary(hoveredCell, st.combatState.boundary) ? hoveredCell : null;
   };
 
   // ================= 游戏交互逻辑 =================
@@ -996,16 +1164,29 @@ export default function TacticsIllusionScreen() {
   
   const handlePointerDown = (e) => {
     interaction.current = { isDown: true, startX: e.clientX, startY: e.clientY, maxDist: 0, lastX: e.clientX, lastY: e.clientY };
+
+    if (stateRef.current.mode === 'COMBAT') {
+      updateCombatHoverFromScreenPoint(e.clientX, e.clientY);
+    }
   };
   
   const handlePointerMove = (e) => {
-    if (!interaction.current.isDown) return;
+    const st = stateRef.current;
+
+    if (!interaction.current.isDown) {
+      if (st.mode === 'COMBAT') {
+        updateCombatHoverFromScreenPoint(e.clientX, e.clientY);
+      }
+      return;
+    }
+
     const dx = e.clientX - interaction.current.lastX; 
     const dy = e.clientY - interaction.current.lastY;
     interaction.current.maxDist = Math.max(interaction.current.maxDist, Math.hypot(e.clientX - interaction.current.startX, e.clientY - interaction.current.startY));
     
     if (interaction.current.maxDist > 10) { 
-      if (stateRef.current.mode === 'EXPLORE') {
+      combatHoverCellRef.current = null;
+      if (st.mode === 'EXPLORE') {
         cameraOffsetRef.current.x += dx;
         cameraOffsetRef.current.y += dy;
       } else {
@@ -1013,6 +1194,8 @@ export default function TacticsIllusionScreen() {
         cameraRef.current.x += dx; 
         cameraRef.current.y += dy; 
       }
+    } else if (st.mode === 'COMBAT') {
+      updateCombatHoverFromScreenPoint(e.clientX, e.clientY);
     }
     interaction.current.lastX = e.clientX; 
     interaction.current.lastY = e.clientY;
@@ -1027,79 +1210,16 @@ export default function TacticsIllusionScreen() {
     }
   };
 
+  const handlePointerLeave = () => {
+    combatHoverCellRef.current = null;
+  };
+
   const handleGridClick = (screenX, screenY) => {
     const st = stateRef.current;
     if (st.mode !== 'EXPLORE' && st.mode !== 'COMBAT') return;
     if (st.mode === 'COMBAT' && (combatBusyRef.current || st.combatState?.isResolving)) return;
 
-    const canvas = canvasRef.current;
-    if(!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const x = screenX - rect.left; 
-    const y = screenY - rect.top;
-    const ctx = canvas.getContext('2d');
-    const { x: camX, y: camY, zoom } = cameraRef.current;
-    const cx = canvas.width/2 + camX; 
-    const cy = canvas.height/2 + camY;
-
-    let clickedCell = null;
-    const renderables = renderablesRef.current;
-
-    for (let i = renderables.length - 1; i >= 0; i--) {
-      const item = renderables[i];
-      if (item.type !== 'cell') {
-        continue;
-      }
-
-      const { x: gx, y: gy } = item;
-      const z0 = worldMap[gx][gy], z1 = worldMap[gx+1][gy], z2 = worldMap[gx+1][gy+1], z3 = worldMap[gx][gy+1];
-      const p0 = toIso(gx, gy, z0), p1 = toIso(gx+1, gy, z1), p2 = toIso(gx+1, gy+1, z2), p3 = toIso(gx, gy+1, z3);
-
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.beginPath();
-      ctx.moveTo(cx + p0.cx * zoom, cy + p0.cy * zoom);
-      ctx.lineTo(cx + p1.cx * zoom, cy + p1.cy * zoom);
-      ctx.lineTo(cx + p2.cx * zoom, cy + p2.cy * zoom);
-      ctx.lineTo(cx + p3.cx * zoom, cy + p3.cy * zoom);
-      ctx.closePath();
-      if (ctx.isPointInPath(x, y)) {
-        clickedCell = {x: item.x, y: item.y};
-        break;
-      }
-    }
-
-    if (!clickedCell) {
-    // 完全不依赖 ctx.scale，直接用欧几里得距离与投影映射判定像素坐标 (极致精准)
-    for (let i = renderables.length - 1; i >= 0; i--) {
-      const item = renderables[i];
-      
-      if (item.type === 'player_leader') {
-       const z = getAnimatedCellZ(worldMap, item.displayPos.x, item.displayPos.y);
-       const pos = toIso(item.displayPos.x+0.5, item.displayPos.y+0.5, z);
-         const hitX = cx + pos.cx * zoom;
-         const hitY = cy + (pos.cy - 15) * zoom;
-         if (Math.hypot(x - hitX, y - hitY) <= 40 * zoom) {
-             clickedCell = {x: st.playerData.pos.x, y: st.playerData.pos.y}; break;
-         }
-      } else if (item.type === 'combat_unit') {
-       const z = getAnimatedCellZ(worldMap, item.displayPos.x, item.displayPos.y);
-       const pos = toIso(item.displayPos.x+0.5, item.displayPos.y+0.5, z);
-         const hitX = cx + pos.cx * zoom; 
-         const hitY = cy + (pos.cy - 12) * zoom;
-         if (Math.hypot(x - hitX, y - hitY) <= 40 * zoom) {
-             clickedCell = {x: item.unit.x, y: item.unit.y}; break;
-         }
-      } else if (item.type === 'entity') {
-         const z = getCellZ(worldMap, item.ent.x, item.ent.y);
-         const pos = toIso(item.ent.x+0.5, item.ent.y+0.5, z);
-         const hitX = cx + pos.cx * zoom; 
-         const hitY = cy + (pos.cy - 15) * zoom;
-         if (Math.hypot(x - hitX, y - hitY) <= 35 * zoom) {
-             clickedCell = {x: item.ent.x, y: item.ent.y}; break;
-         }
-      }
-    }
-      }
+    const clickedCell = getGridCellFromScreenPoint(screenX, screenY, { allowEntityFallback: true });
 
     if(clickedCell) {
        if (st.mode === 'EXPLORE') handleExploreGridClick(clickedCell.x, clickedCell.y);
@@ -1308,6 +1428,12 @@ export default function TacticsIllusionScreen() {
 
       const renderList = [];
       const combatBoundary = st.mode === 'COMBAT' && st.combatState ? st.combatState.boundary : null;
+      const hoveredCombatCell = st.mode === 'COMBAT' && st.combatState && isWithinCombatBoundary(combatHoverCellRef.current, combatBoundary)
+        ? combatHoverCellRef.current
+        : null;
+      const hoveredCombatUnit = hoveredCombatCell
+        ? getCombatUnitAt(st.combatState.units, hoveredCombatCell.x, hoveredCombatCell.y)
+        : null;
 
       for (let x = 0; x < WORLD_SIZE; x++) {
         for (let y = 0; y < WORLD_SIZE; y++) {
@@ -1400,6 +1526,18 @@ export default function TacticsIllusionScreen() {
                ctx.strokeStyle = hl.type === 'move' ? '#60a5fa' : '#f87171'; ctx.lineWidth = 2; ctx.stroke();
              }
           }
+
+          if (hoveredCombatCell && hoveredCombatCell.x === x && hoveredCombatCell.y === y) {
+            const hoverPalette = getCombatHoverPalette(hoveredCombatUnit?.team);
+            ctx.save();
+            ctx.fillStyle = hoverPalette.fill;
+            ctx.fill();
+            ctx.strokeStyle = hoverPalette.stroke;
+            ctx.lineWidth = 2.5;
+            ctx.setLineDash([8, 4]);
+            ctx.stroke();
+            ctx.restore();
+          }
         } 
         else if (item.type === 'entity') {
           const { ent, opacity, dimmed } = item;
@@ -1491,7 +1629,7 @@ export default function TacticsIllusionScreen() {
           ctx.strokeStyle='white'; ctx.lineWidth=2; ctx.stroke();
 
           if (st.combatState.selectedUnit?.uid === unit.uid) {
-            ctx.strokeStyle = '#fde047'; ctx.lineWidth = 3;
+            ctx.strokeStyle = getUnitSelectionStroke(unit.team); ctx.lineWidth = 3;
             ctx.beginPath(); ctx.arc(0, -15, 23, 0, Math.PI*2); ctx.stroke();
           }
 
@@ -1500,6 +1638,13 @@ export default function TacticsIllusionScreen() {
           ctx.fillStyle = hpRatio > 0.5 ? '#22c55e' : hpRatio > 0.2 ? '#f59e0b' : '#ef4444';
           ctx.fillRect(-14, 11, 28 * hpRatio, 3);
           ctx.restore();
+
+          if (hoveredCombatUnit?.uid === unit.uid) {
+            ctx.save();
+            ctx.translate(pos.cx + pose.jitterX, pos.cy - 12 + pose.jitterY - pose.liftY);
+            drawCombatPreviewArrow(ctx, now, unit.team);
+            ctx.restore();
+          }
         }
       });
 
@@ -1535,6 +1680,7 @@ export default function TacticsIllusionScreen() {
         onPointerDown={handlePointerDown} 
         onPointerMove={handlePointerMove} 
         onPointerUp={handlePointerUp}
+        onPointerLeave={handlePointerLeave}
         onPointerCancel={handlePointerUp}
         onContextMenu={(e) => e.preventDefault()}
       />
