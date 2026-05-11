@@ -10,13 +10,27 @@ import CampMenuScreen from './CampMenuScreen.jsx';
 import DialogScreen from './DialogScreen.jsx';
 
 const MOVE_TWEEN_DURATION = 240;
+const CAMERA_TWEEN_DURATION = 560;
 const TWEEN_EPSILON = 0.001;
 const EXPLORE_CAMERA_Y_OFFSET = 100;
+const COMBAT_CAMERA_Y_OFFSET = 50;
 const CAMERA_FOLLOW_DAMPING = 10;
+const COMBAT_FADE_DISTANCE = 6;
+const COMBAT_DIMMED_ENTITY_ALPHA = 0.45;
+const COMBAT_ENTITY_FILTER = 'grayscale(1) saturate(0.15) brightness(0.9)';
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
 const easeOutCubic = (value) => 1 - ((1 - value) ** 3);
+
+const createTimedTween = (from, to, duration = MOVE_TWEEN_DURATION, startedAt = performance.now()) => ({
+  fromX: from.x,
+  fromY: from.y,
+  toX: to.x,
+  toY: to.y,
+  startedAt,
+  duration,
+});
 
 const getTweenPosition = (tween, now) => {
   if (!tween || tween.duration === 0) {
@@ -89,6 +103,26 @@ const pruneTweenTargets = (tweenStore, validKeys) => {
   });
 };
 
+const hasTweenArrived = (position, tween) => Math.abs(position.x - tween.toX) <= TWEEN_EPSILON && Math.abs(position.y - tween.toY) <= TWEEN_EPSILON;
+
+const getDistanceOutsideBoundary = (x, y, boundary) => {
+  const dx = x < boundary.minX ? boundary.minX - x : x > boundary.maxX ? x - boundary.maxX : 0;
+  const dy = y < boundary.minY ? boundary.minY - y : y > boundary.maxY ? y - boundary.maxY : 0;
+
+  return Math.max(dx, dy);
+};
+
+const getCombatCellOpacity = (x, y, boundary, fadeDistance = COMBAT_FADE_DISTANCE) => {
+  const distanceOutside = getDistanceOutsideBoundary(x, y, boundary);
+
+  if (distanceOutside === 0) {
+    return 1;
+  }
+
+  const normalized = clamp(1 - distanceOutside / fadeDistance, 0, 1);
+  return normalized ** 1.6;
+};
+
 const getAnimatedCellZ = (heightMap, x, y, worldSize = WORLD_SIZE) => {
   const clampedX = clamp(x, 0, worldSize - 1);
   const clampedY = clamp(y, 0, worldSize - 1);
@@ -147,6 +181,7 @@ export default function TacticsIllusionScreen() {
   const floatingTextsRef = useRef([]);
   const renderablesRef = useRef([]); 
   const motionTweensRef = useRef({});
+  const cameraTweenRef = useRef(null);
   const previousFrameTimeRef = useRef(0);
   const stateRef = useLatestRef({ mode, playerData, entities, combatState, exploreState });
 
@@ -156,6 +191,14 @@ export default function TacticsIllusionScreen() {
     cameraRef.current.x = cameraPos.x;
     cameraRef.current.y = cameraPos.y;
   }, []);
+
+  const tweenCameraTo = (targetPosition, duration = CAMERA_TWEEN_DURATION) => {
+    cameraTweenRef.current = createTimedTween(
+      { x: cameraRef.current.x, y: cameraRef.current.y },
+      targetPosition,
+      duration,
+    );
+  };
 
   // ================= BFS寻路 =================
   const calculateMoveOptions = (startX, startY, moveRange, jumpPower, ignoreEntities = false, boundary = null) => {
@@ -225,8 +268,7 @@ export default function TacticsIllusionScreen() {
 
     setCombatState(nextCombatState);
     setMode('COMBAT');
-    const pos = toIso(centerX, centerY, getCellZ(worldMap, centerX, centerY));
-    cameraRef.current.x = -pos.cx; cameraRef.current.y = -pos.cy + 50;
+    tweenCameraTo(getCameraFocusPosition(worldMap, centerX, centerY, COMBAT_CAMERA_Y_OFFSET));
     showFloatText(centerX, centerY, '遭遇战!', '#ef4444');
   };
 
@@ -400,6 +442,7 @@ export default function TacticsIllusionScreen() {
         cameraOffsetRef.current.x += dx;
         cameraOffsetRef.current.y += dy;
       } else {
+        cameraTweenRef.current = null;
         cameraRef.current.x += dx; 
         cameraRef.current.y += dy; 
       }
@@ -611,6 +654,7 @@ export default function TacticsIllusionScreen() {
       const playerDisplayPos = syncTweenTarget(motionTweensRef.current, 'player_leader', st.playerData.pos, now);
 
       if (st.mode === 'EXPLORE') {
+        cameraTweenRef.current = null;
         const cameraFocusTarget = getCameraFocusPosition(worldMap, playerDisplayPos.x, playerDisplayPos.y, EXPLORE_CAMERA_Y_OFFSET);
         const currentCameraFollow = {
           x: cameraRef.current.x - cameraOffsetRef.current.x,
@@ -619,6 +663,16 @@ export default function TacticsIllusionScreen() {
         const cameraFollowPos = dampTowards(currentCameraFollow, cameraFocusTarget, deltaMs);
         cameraRef.current.x = cameraFollowPos.x + cameraOffsetRef.current.x;
         cameraRef.current.y = cameraFollowPos.y + cameraOffsetRef.current.y;
+      } else if (cameraTweenRef.current) {
+        const tweenedCameraPos = getTweenPosition(cameraTweenRef.current, now);
+        cameraRef.current.x = tweenedCameraPos.x;
+        cameraRef.current.y = tweenedCameraPos.y;
+
+        if (hasTweenArrived(tweenedCameraPos, cameraTweenRef.current)) {
+          cameraRef.current.x = cameraTweenRef.current.toX;
+          cameraRef.current.y = cameraTweenRef.current.toY;
+          cameraTweenRef.current = null;
+        }
       }
 
       ctx.save();
@@ -627,16 +681,24 @@ export default function TacticsIllusionScreen() {
       ctx.translate(cx, cy); ctx.scale(zoom, zoom);
 
       const renderList = [];
+      const combatBoundary = st.mode === 'COMBAT' && st.combatState ? st.combatState.boundary : null;
 
       for (let x = 0; x < WORLD_SIZE; x++) {
         for (let y = 0; y < WORLD_SIZE; y++) {
           const z = getCellZ(worldMap, x, y);
           const pos = toIso(x+0.5, y+0.5, z);
           if (cx + pos.cx*zoom < -150 || cx + pos.cx*zoom > canvas.width+150 || cy + pos.cy*zoom < -150 || cy + pos.cy*zoom > canvas.height+150) continue;
+          const cellOpacity = combatBoundary ? getCombatCellOpacity(x, y, combatBoundary) : 1;
+          if (cellOpacity <= TWEEN_EPSILON) continue;
           
-          renderList.push({ type: 'cell', x, y, z: x+y });
+          renderList.push({ type: 'cell', x, y, z: x+y, opacity: cellOpacity });
           const ent = st.entities.find(e => e.x === x && e.y === y);
-          if (ent) renderList.push({ type: 'entity', ent, z: x+y+0.5 });
+          if (ent && (!combatBoundary || ent.type !== 'enemy_patrol' || ent.id !== st.combatState.enemyEntId)) {
+            const entityOpacity = combatBoundary ? cellOpacity * COMBAT_DIMMED_ENTITY_ALPHA : 1;
+            if (entityOpacity > TWEEN_EPSILON) {
+              renderList.push({ type: 'entity', ent, z: x+y+0.5, opacity: entityOpacity, dimmed: Boolean(combatBoundary) });
+            }
+          }
         }
       }
 
@@ -662,7 +724,7 @@ export default function TacticsIllusionScreen() {
 
       renderList.forEach(item => {
         if (item.type === 'cell') {
-          const { x, y } = item;
+          const { x, y, opacity } = item;
           const z0 = worldMap[x][y], z1 = worldMap[x+1][y], z2 = worldMap[x+1][y+1], z3 = worldMap[x][y+1];
           const avgZ = (z0+z1+z2+z3)/4;
           const p0 = toIso(x, y, z0), p1 = toIso(x+1, y, z1), p2 = toIso(x+1, y+1, z2), p3 = toIso(x, y+1, z3);
@@ -670,17 +732,29 @@ export default function TacticsIllusionScreen() {
           ctx.beginPath();
           ctx.moveTo(p0.cx, p0.cy); ctx.lineTo(p1.cx, p1.cy); ctx.lineTo(p2.cx, p2.cy); ctx.lineTo(p3.cx, p3.cy);
           ctx.closePath();
-          
-          ctx.fillStyle = getTerrainColor(avgZ);
-          
-          if (st.mode === 'COMBAT') {
-             const b = st.combatState.boundary;
-             if (x < b.minX || x > b.maxX || y < b.minY || y > b.maxY) ctx.fillStyle = '#1e293b'; 
-             else if (x === b.minX || x === b.maxX || y === b.minY || y === b.maxY) ctx.fillStyle = COLORS.combatBoundary;
-          }
 
+          ctx.save();
+          ctx.globalAlpha = opacity;
+          ctx.fillStyle = getTerrainColor(avgZ);
           ctx.fill();
           ctx.strokeStyle = 'rgba(255,255,255,0.06)'; ctx.lineWidth = 1; ctx.stroke();
+          ctx.restore();
+
+          if (
+            combatBoundary
+            && x >= combatBoundary.minX && x <= combatBoundary.maxX
+            && y >= combatBoundary.minY && y <= combatBoundary.maxY
+            && (x === combatBoundary.minX || x === combatBoundary.maxX || y === combatBoundary.minY || y === combatBoundary.maxY)
+          ) {
+            ctx.save();
+            ctx.globalAlpha = 0.9;
+            ctx.fillStyle = COLORS.combatBoundary;
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(251,191,36,0.3)';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+            ctx.restore();
+          }
 
           if (st.mode === 'EXPLORE' && st.exploreState.isSelected) {
             if(st.exploreState.hlCells.find(c => c.x === x && c.y === y)) {
@@ -700,21 +774,26 @@ export default function TacticsIllusionScreen() {
           }
         } 
         else if (item.type === 'entity') {
-          const { ent } = item;
-          if (st.mode === 'COMBAT' && ent.type === 'enemy_patrol' && ent.id === st.combatState.enemyEntId) return;
+          const { ent, opacity, dimmed } = item;
+          if (opacity <= TWEEN_EPSILON) return;
 
           const z = getCellZ(worldMap, ent.x, ent.y);
           const pos = toIso(ent.x+0.5, ent.y+0.5, z);
           ctx.save(); ctx.translate(pos.cx, pos.cy - 15);
+          ctx.globalAlpha = opacity;
+          if (dimmed) {
+            ctx.filter = COMBAT_ENTITY_FILTER;
+          }
           
           if(ent.type === 'shrine' || ent.type === 'village') {
+            ctx.fillStyle = dimmed ? '#e2e8f0' : 'white';
             ctx.font = '30px Arial'; ctx.textAlign = 'center'; ctx.fillText(ent.icon, 0, 0);
-            ctx.fillStyle = 'white'; ctx.font = '12px Arial'; ctx.fillText(ent.name, 0, 18);
+            ctx.fillStyle = dimmed ? '#94a3b8' : 'white'; ctx.font = '12px Arial'; ctx.fillText(ent.name, 0, 18);
           } else {
              ctx.fillStyle = 'rgba(0,0,0,0.3)'; ctx.beginPath(); ctx.ellipse(0, 15, 12, 6, 0, 0, Math.PI*2); ctx.fill();
-             ctx.fillStyle = ent.type === 'enemy_patrol' ? '#ef4444' : '#fbbf24';
+             ctx.fillStyle = dimmed ? '#64748b' : ent.type === 'enemy_patrol' ? '#ef4444' : '#fbbf24';
              ctx.beginPath(); ctx.arc(0, 0, 14, 0, Math.PI*2); ctx.fill();
-             ctx.fillStyle='white'; ctx.font='16px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(ent.icon, 0, 0);
+             ctx.fillStyle = dimmed ? '#e2e8f0' : 'white'; ctx.font='16px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(ent.icon, 0, 0);
           }
           ctx.restore();
         }
