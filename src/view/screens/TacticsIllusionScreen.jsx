@@ -9,6 +9,112 @@ import TopHud from '../components/TopHud.jsx';
 import CampMenuScreen from './CampMenuScreen.jsx';
 import DialogScreen from './DialogScreen.jsx';
 
+const MOVE_TWEEN_DURATION = 240;
+const TWEEN_EPSILON = 0.001;
+const EXPLORE_CAMERA_Y_OFFSET = 100;
+
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+
+const easeOutCubic = (value) => 1 - ((1 - value) ** 3);
+
+const getTweenPosition = (tween, now) => {
+  if (!tween || tween.duration === 0) {
+    return tween ? { x: tween.toX, y: tween.toY } : null;
+  }
+
+  const progress = clamp((now - tween.startedAt) / tween.duration, 0, 1);
+  const eased = easeOutCubic(progress);
+
+  return {
+    x: tween.fromX + (tween.toX - tween.fromX) * eased,
+    y: tween.fromY + (tween.toY - tween.fromY) * eased,
+  };
+};
+
+const syncTweenTarget = (tweenStore, key, target, now, options = {}) => {
+  const initialPosition = options.initialPosition ?? target;
+  const duration = options.duration ?? MOVE_TWEEN_DURATION;
+  const existingTween = tweenStore[key];
+
+  if (!existingTween) {
+    const needsTween = Math.abs(initialPosition.x - target.x) > TWEEN_EPSILON || Math.abs(initialPosition.y - target.y) > TWEEN_EPSILON;
+    tweenStore[key] = {
+      fromX: needsTween ? initialPosition.x : target.x,
+      fromY: needsTween ? initialPosition.y : target.y,
+      toX: target.x,
+      toY: target.y,
+      startedAt: now,
+      duration: needsTween ? duration : 0,
+    };
+    return needsTween ? { ...initialPosition } : { ...target };
+  }
+
+  const currentPosition = getTweenPosition(existingTween, now);
+  const hasNewTarget = Math.abs(existingTween.toX - target.x) > TWEEN_EPSILON || Math.abs(existingTween.toY - target.y) > TWEEN_EPSILON;
+
+  if (hasNewTarget) {
+    tweenStore[key] = {
+      fromX: currentPosition.x,
+      fromY: currentPosition.y,
+      toX: target.x,
+      toY: target.y,
+      startedAt: now,
+      duration,
+    };
+    return currentPosition;
+  }
+
+  const hasArrived = Math.abs(currentPosition.x - existingTween.toX) <= TWEEN_EPSILON && Math.abs(currentPosition.y - existingTween.toY) <= TWEEN_EPSILON;
+  if (hasArrived && existingTween.duration !== 0) {
+    tweenStore[key] = {
+      fromX: existingTween.toX,
+      fromY: existingTween.toY,
+      toX: existingTween.toX,
+      toY: existingTween.toY,
+      startedAt: now,
+      duration: 0,
+    };
+    return { x: existingTween.toX, y: existingTween.toY };
+  }
+
+  return currentPosition;
+};
+
+const pruneTweenTargets = (tweenStore, validKeys) => {
+  Object.keys(tweenStore).forEach((key) => {
+    if (!validKeys.has(key)) {
+      delete tweenStore[key];
+    }
+  });
+};
+
+const getAnimatedCellZ = (heightMap, x, y, worldSize = WORLD_SIZE) => {
+  const clampedX = clamp(x, 0, worldSize - 1);
+  const clampedY = clamp(y, 0, worldSize - 1);
+  const x0 = Math.floor(clampedX);
+  const y0 = Math.floor(clampedY);
+  const x1 = Math.min(worldSize - 1, x0 + 1);
+  const y1 = Math.min(worldSize - 1, y0 + 1);
+  const tx = clampedX - x0;
+  const ty = clampedY - y0;
+  const z00 = getCellZ(heightMap, x0, y0, worldSize);
+  const z10 = getCellZ(heightMap, x1, y0, worldSize);
+  const z01 = getCellZ(heightMap, x0, y1, worldSize);
+  const z11 = getCellZ(heightMap, x1, y1, worldSize);
+
+  return z00 * (1 - tx) * (1 - ty) + z10 * tx * (1 - ty) + z01 * (1 - tx) * ty + z11 * tx * ty;
+};
+
+const getCameraFocusPosition = (heightMap, x, y, yOffset, worldSize = WORLD_SIZE) => {
+  const z = getAnimatedCellZ(heightMap, x, y, worldSize);
+  const pos = toIso(x, y, z);
+
+  return {
+    x: -pos.cx,
+    y: -pos.cy + yOffset,
+  };
+};
+
 export default function TacticsIllusionScreen() {
   const canvasRef = useRef(null);
   
@@ -23,14 +129,17 @@ export default function TacticsIllusionScreen() {
 
   // 高性能引用库
   const cameraRef = useRef({ x: 0, y: 200, zoom: 1 });
+  const cameraOffsetRef = useRef({ x: 0, y: 0 });
   const floatingTextsRef = useRef([]);
   const renderablesRef = useRef([]); 
+  const motionTweensRef = useRef({});
   const stateRef = useLatestRef({ mode, playerData, entities, combatState, exploreState });
 
   useEffect(() => {
     const p = playerData.pos;
-    const pos = toIso(p.x, p.y, getCellZ(worldMap, p.x, p.y));
-    cameraRef.current.x = -pos.cx; cameraRef.current.y = -pos.cy + 100;
+    const cameraPos = getCameraFocusPosition(worldMap, p.x, p.y, EXPLORE_CAMERA_Y_OFFSET);
+    cameraRef.current.x = cameraPos.x;
+    cameraRef.current.y = cameraPos.y;
   }, []);
 
   // ================= BFS寻路 =================
@@ -68,8 +177,6 @@ export default function TacticsIllusionScreen() {
       } else if (canMoveTo) {
         setPlayerData(prev => ({ ...prev, pos: { x: tx, y: ty } }));
         setExploreState({ isSelected: false, hlCells: [] });
-        const targetPos = toIso(tx, ty, getCellZ(worldMap, tx, ty));
-        cameraRef.current.x = -targetPos.cx; cameraRef.current.y = -targetPos.cy + 100;
       } else {
         setExploreState({ isSelected: false, hlCells: [] });
       }
@@ -205,30 +312,55 @@ export default function TacticsIllusionScreen() {
       let delay = 800;
       combatState.units.filter(u => u.team === 'enemy' && u.hp > 0).forEach((enemy, idx) => {
         setTimeout(() => {
-          setCombatState(currState => {
-            const currentEnemy = currState.units.find(u=>u.uid === enemy.uid);
-            if(!currentEnemy || currentEnemy.hp <= 0) return currState;
+          const currentState = stateRef.current.combatState;
+          const currentEnemy = currentState?.units.find(u => u.uid === enemy.uid);
+          if (!currentEnemy || currentEnemy.hp <= 0) {
+            setTimeout(() => checkBattleResult(), 0);
+            return;
+          }
 
-            let newUnits = [...currState.units];
-            const moves = calculateMoveOptions(currentEnemy.x, currentEnemy.y, currentEnemy.move, currentEnemy.jump, false, currState.boundary);
-            if (moves.length > 0) {
-              const moveTarget = moves[Math.floor(Math.random() * moves.length)];
-              newUnits = newUnits.map(u => u.uid === currentEnemy.uid ? { ...u, x: moveTarget.x, y: moveTarget.y, hasMoved: true } : u);
-            }
-            
-            const updatedEnemy = newUnits.find(u=>u.uid === enemy.uid);
-            for(let tgt of newUnits) {
-               if(tgt.team === 'player' && tgt.hp > 0 && Math.abs(tgt.x - updatedEnemy.x) + Math.abs(tgt.y - updatedEnemy.y) <= updatedEnemy.range) {
-                    const dmg = Math.floor(updatedEnemy.atk * (0.8+Math.random()*0.4));
-                    showFloatText(tgt.x, tgt.y, `-${dmg}`, '#ef4444');
-                    newUnits = newUnits.map(u => u.uid === tgt.uid ? {...u, hp: Math.max(0, u.hp-dmg)} : u);
-                    break;
-               }
-            }
-            newUnits = newUnits.map(u => u.uid === currentEnemy.uid ? { ...u, hasActed: true } : u);
-            return {...currState, units: newUnits};
-          });
-          setTimeout(() => checkBattleResult(), 400); 
+          const moves = calculateMoveOptions(currentEnemy.x, currentEnemy.y, currentEnemy.move, currentEnemy.jump, false, currentState.boundary);
+          const moveTarget = moves.length > 0 ? moves[Math.floor(Math.random() * moves.length)] : null;
+          const attackDelay = moveTarget ? MOVE_TWEEN_DURATION : 0;
+
+          setCombatState(currState => ({
+            ...currState,
+            units: currState.units.map((unit) => {
+              if (unit.uid !== enemy.uid) {
+                return unit;
+              }
+
+              return {
+                ...unit,
+                x: moveTarget ? moveTarget.x : unit.x,
+                y: moveTarget ? moveTarget.y : unit.y,
+                hasMoved: true,
+              };
+            }),
+          }));
+
+          setTimeout(() => {
+            setCombatState(currState => {
+              const updatedEnemy = currState.units.find(u => u.uid === enemy.uid);
+              if (!updatedEnemy || updatedEnemy.hp <= 0) {
+                return currState;
+              }
+
+              let newUnits = [...currState.units];
+              for (const tgt of newUnits) {
+                if (tgt.team === 'player' && tgt.hp > 0 && Math.abs(tgt.x - updatedEnemy.x) + Math.abs(tgt.y - updatedEnemy.y) <= updatedEnemy.range) {
+                  const dmg = Math.floor(updatedEnemy.atk * (0.8 + Math.random() * 0.4));
+                  showFloatText(tgt.x, tgt.y, `-${dmg}`, '#ef4444');
+                  newUnits = newUnits.map(u => u.uid === tgt.uid ? { ...u, hp: Math.max(0, u.hp - dmg) } : u);
+                  break;
+                }
+              }
+
+              newUnits = newUnits.map(u => u.uid === updatedEnemy.uid ? { ...u, hasActed: true } : u);
+              return { ...currState, units: newUnits };
+            });
+            setTimeout(() => checkBattleResult(), 400);
+          }, attackDelay);
         }, delay * (idx + 1));
       });
     }
@@ -248,8 +380,13 @@ export default function TacticsIllusionScreen() {
     interaction.current.maxDist = Math.max(interaction.current.maxDist, Math.hypot(e.clientX - interaction.current.startX, e.clientY - interaction.current.startY));
     
     if (interaction.current.maxDist > 10) { 
-      cameraRef.current.x += dx; 
-      cameraRef.current.y += dy; 
+      if (stateRef.current.mode === 'EXPLORE') {
+        cameraOffsetRef.current.x += dx;
+        cameraOffsetRef.current.y += dy;
+      } else {
+        cameraRef.current.x += dx; 
+        cameraRef.current.y += dy; 
+      }
     }
     interaction.current.lastX = e.clientX; 
     interaction.current.lastY = e.clientY;
@@ -286,16 +423,16 @@ export default function TacticsIllusionScreen() {
       const item = renderables[i];
       
       if (item.type === 'player_leader') {
-         const z = getCellZ(worldMap, st.playerData.pos.x, st.playerData.pos.y);
-         const pos = toIso(st.playerData.pos.x+0.5, st.playerData.pos.y+0.5, z);
+       const z = getAnimatedCellZ(worldMap, item.displayPos.x, item.displayPos.y);
+       const pos = toIso(item.displayPos.x+0.5, item.displayPos.y+0.5, z);
          const hitX = cx + pos.cx * zoom;
          const hitY = cy + (pos.cy - 15) * zoom;
          if (Math.hypot(x - hitX, y - hitY) <= 40 * zoom) {
              clickedCell = {x: st.playerData.pos.x, y: st.playerData.pos.y}; break;
          }
       } else if (item.type === 'combat_unit') {
-         const z = getCellZ(worldMap, item.unit.x, item.unit.y);
-         const pos = toIso(item.unit.x+0.5, item.unit.y+0.5, z);
+       const z = getAnimatedCellZ(worldMap, item.displayPos.x, item.displayPos.y);
+       const pos = toIso(item.displayPos.x+0.5, item.displayPos.y+0.5, z);
          const hitX = cx + pos.cx * zoom; 
          const hitY = cy + (pos.cy - 12) * zoom;
          if (Math.hypot(x - hitX, y - hitY) <= 40 * zoom) {
@@ -446,16 +583,30 @@ export default function TacticsIllusionScreen() {
     const ctx = canvas.getContext('2d');
     let frameId;
 
-    const render = () => {
+    const render = (frameTime) => {
+      const now = frameTime ?? performance.now();
       canvas.width = window.innerWidth; canvas.height = window.innerHeight;
       ctx.fillStyle = '#0f172a'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      const st = stateRef.current;
+      const activeTweenKeys = new Set(['player_leader']);
+      const playerDisplayPos = syncTweenTarget(motionTweensRef.current, 'player_leader', st.playerData.pos, now);
+
+      if (st.mode === 'EXPLORE') {
+        activeTweenKeys.add('camera_follow');
+        const cameraFocusTarget = getCameraFocusPosition(worldMap, st.playerData.pos.x, st.playerData.pos.y, EXPLORE_CAMERA_Y_OFFSET);
+        const cameraFollowPos = syncTweenTarget(motionTweensRef.current, 'camera_follow', cameraFocusTarget, now, {
+          initialPosition: cameraRef.current,
+        });
+        cameraRef.current.x = cameraFollowPos.x + cameraOffsetRef.current.x;
+        cameraRef.current.y = cameraFollowPos.y + cameraOffsetRef.current.y;
+      }
 
       ctx.save();
       const { x: camX, y: camY, zoom } = cameraRef.current;
       const cx = canvas.width/2 + camX; const cy = canvas.height/2 + camY;
       ctx.translate(cx, cy); ctx.scale(zoom, zoom);
 
-      const st = stateRef.current;
       const renderList = [];
 
       for (let x = 0; x < WORLD_SIZE; x++) {
@@ -467,16 +618,25 @@ export default function TacticsIllusionScreen() {
           renderList.push({ type: 'cell', x, y, z: x+y });
           const ent = st.entities.find(e => e.x === x && e.y === y);
           if (ent) renderList.push({ type: 'entity', ent, z: x+y+0.5 });
-          
-          if (st.mode === 'EXPLORE' && st.playerData.pos.x === x && st.playerData.pos.y === y) {
-            renderList.push({ type: 'player_leader', z: x+y+0.6 });
-          }
-          if (st.mode === 'COMBAT') {
-            const u = getCombatUnitAt(st.combatState.units, x, y);
-            if (u) renderList.push({ type: 'combat_unit', unit: u, z: x+y+0.6 });
-          }
         }
       }
+
+      if (st.mode === 'EXPLORE') {
+        renderList.push({ type: 'player_leader', displayPos: playerDisplayPos, z: playerDisplayPos.x + playerDisplayPos.y + 0.6 });
+      }
+
+      if (st.mode === 'COMBAT' && st.combatState) {
+        st.combatState.units
+          .filter((unit) => unit.hp > 0)
+          .forEach((unit) => {
+            const tweenKey = `combat_unit:${unit.uid}`;
+            activeTweenKeys.add(tweenKey);
+            const displayPos = syncTweenTarget(motionTweensRef.current, tweenKey, { x: unit.x, y: unit.y }, now);
+            renderList.push({ type: 'combat_unit', unit, displayPos, z: displayPos.x + displayPos.y + 0.6 });
+          });
+      }
+
+      pruneTweenTargets(motionTweensRef.current, activeTweenKeys);
 
       renderList.sort((a, b) => a.z - b.z);
       renderablesRef.current = renderList; 
@@ -540,16 +700,15 @@ export default function TacticsIllusionScreen() {
           ctx.restore();
         }
         else if (item.type === 'player_leader') {
-          const p = st.playerData.pos;
-          const z = getCellZ(worldMap, p.x, p.y);
-          const pos = toIso(p.x+0.5, p.y+0.5, z);
+          const z = getAnimatedCellZ(worldMap, item.displayPos.x, item.displayPos.y);
+          const pos = toIso(item.displayPos.x+0.5, item.displayPos.y+0.5, z);
           const leader = st.playerData.party[0];
           
           ctx.save(); ctx.translate(pos.cx, pos.cy - 15);
-          const hoverY = Math.sin(Date.now() / 200) * 3; ctx.translate(0, hoverY);
+          const hoverY = Math.sin(now / 200) * 3; ctx.translate(0, hoverY);
           
           if (st.mode === 'EXPLORE' && !st.exploreState.isSelected) {
-            const pulse = Math.abs(Math.sin(Date.now() / 400));
+            const pulse = Math.abs(Math.sin(now / 400));
             ctx.strokeStyle = `rgba(251, 191, 36, ${0.4 + pulse * 0.6})`; 
             ctx.lineWidth = 2 + pulse * 4;
             ctx.beginPath(); ctx.arc(0, 0, 22 + pulse * 6, 0, Math.PI*2); ctx.stroke();
@@ -566,8 +725,8 @@ export default function TacticsIllusionScreen() {
         }
         else if (item.type === 'combat_unit') {
           const { unit } = item;
-          const z = getCellZ(worldMap, unit.x, unit.y);
-          const pos = toIso(unit.x+0.5, unit.y+0.5, z);
+          const z = getAnimatedCellZ(worldMap, item.displayPos.x, item.displayPos.y);
+          const pos = toIso(item.displayPos.x+0.5, item.displayPos.y+0.5, z);
           const job = JOBS[unit.job];
           
           ctx.save(); ctx.translate(pos.cx, pos.cy - 12);
