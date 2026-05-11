@@ -12,6 +12,7 @@ import DialogScreen from './DialogScreen.jsx';
 const MOVE_TWEEN_DURATION = 240;
 const TWEEN_EPSILON = 0.001;
 const EXPLORE_CAMERA_Y_OFFSET = 100;
+const CAMERA_FOLLOW_DAMPING = 10;
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
@@ -115,6 +116,19 @@ const getCameraFocusPosition = (heightMap, x, y, yOffset, worldSize = WORLD_SIZE
   };
 };
 
+const dampTowards = (current, target, deltaMs, damping = CAMERA_FOLLOW_DAMPING) => {
+  if (deltaMs <= 0) {
+    return current;
+  }
+
+  const blend = 1 - Math.exp((-damping * deltaMs) / 1000);
+
+  return {
+    x: current.x + (target.x - current.x) * blend,
+    y: current.y + (target.y - current.y) * blend,
+  };
+};
+
 export default function TacticsIllusionScreen() {
   const canvasRef = useRef(null);
   
@@ -133,6 +147,7 @@ export default function TacticsIllusionScreen() {
   const floatingTextsRef = useRef([]);
   const renderablesRef = useRef([]); 
   const motionTweensRef = useRef({});
+  const previousFrameTimeRef = useRef(0);
   const stateRef = useLatestRef({ mode, playerData, entities, combatState, exploreState });
 
   useEffect(() => {
@@ -585,6 +600,8 @@ export default function TacticsIllusionScreen() {
 
     const render = (frameTime) => {
       const now = frameTime ?? performance.now();
+      const deltaMs = previousFrameTimeRef.current ? now - previousFrameTimeRef.current : 0;
+      previousFrameTimeRef.current = now;
       canvas.width = window.innerWidth; canvas.height = window.innerHeight;
       ctx.fillStyle = '#0f172a'; ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -593,11 +610,12 @@ export default function TacticsIllusionScreen() {
       const playerDisplayPos = syncTweenTarget(motionTweensRef.current, 'player_leader', st.playerData.pos, now);
 
       if (st.mode === 'EXPLORE') {
-        activeTweenKeys.add('camera_follow');
-        const cameraFocusTarget = getCameraFocusPosition(worldMap, st.playerData.pos.x, st.playerData.pos.y, EXPLORE_CAMERA_Y_OFFSET);
-        const cameraFollowPos = syncTweenTarget(motionTweensRef.current, 'camera_follow', cameraFocusTarget, now, {
-          initialPosition: cameraRef.current,
-        });
+        const cameraFocusTarget = getCameraFocusPosition(worldMap, playerDisplayPos.x, playerDisplayPos.y, EXPLORE_CAMERA_Y_OFFSET);
+        const currentCameraFollow = {
+          x: cameraRef.current.x - cameraOffsetRef.current.x,
+          y: cameraRef.current.y - cameraOffsetRef.current.y,
+        };
+        const cameraFollowPos = dampTowards(currentCameraFollow, cameraFocusTarget, deltaMs);
         cameraRef.current.x = cameraFollowPos.x + cameraOffsetRef.current.x;
         cameraRef.current.y = cameraFollowPos.y + cameraOffsetRef.current.y;
       }
