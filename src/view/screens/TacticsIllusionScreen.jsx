@@ -219,6 +219,7 @@ export default function TacticsIllusionScreen() {
       playerData: st.playerData,
       enemyEnt,
       actualPlayerPos,
+      heightMap: worldMap,
       worldSize: WORLD_SIZE,
     });
 

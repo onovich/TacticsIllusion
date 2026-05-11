@@ -2,6 +2,86 @@ import { GEMS, JOBS, WORLD_SIZE } from '../../data/gameData.js';
 
 export const getCombatUnitAt = (units, x, y) => units.find((unit) => unit.x === x && unit.y === y && unit.hp > 0);
 
+const PLAYER_FORMATION = [
+  { x: 0, y: 0 },
+  { x: -1, y: 0 },
+  { x: 0, y: -1 },
+  { x: -1, y: -1 },
+  { x: 1, y: 0 },
+  { x: 0, y: 1 },
+];
+
+const ENEMY_FORMATION = [
+  { x: 0, y: 0 },
+  { x: 1, y: 0 },
+  { x: 0, y: 1 },
+  { x: 1, y: 1 },
+  { x: -1, y: 0 },
+  { x: 0, y: -1 },
+];
+
+const getCellKey = (x, y) => `${x},${y}`;
+
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+
+const createSearchOffsets = (maxDistance = 6) => {
+  const offsets = [{ x: 0, y: 0 }];
+
+  for (let distance = 1; distance <= maxDistance; distance += 1) {
+    for (let dx = -distance; dx <= distance; dx += 1) {
+      const dy = distance - Math.abs(dx);
+      offsets.push({ x: dx, y: dy });
+      if (dy !== 0) {
+        offsets.push({ x: dx, y: -dy });
+      }
+    }
+  }
+
+  return offsets;
+};
+
+const SEARCH_OFFSETS = createSearchOffsets();
+
+const isSpawnCellValid = ({ x, y, boundary, occupiedCells, heightMap }) => {
+  if (x < boundary.minX || x > boundary.maxX || y < boundary.minY || y > boundary.maxY) {
+    return false;
+  }
+
+  if (occupiedCells.has(getCellKey(x, y))) {
+    return false;
+  }
+
+  if (heightMap && heightMap[x]?.[y] < 1) {
+    return false;
+  }
+
+  return true;
+};
+
+const findSpawnCell = ({ anchorX, anchorY, boundary, occupiedCells, heightMap }) => {
+  for (const offset of SEARCH_OFFSETS) {
+    const x = anchorX + offset.x;
+    const y = anchorY + offset.y;
+
+    if (isSpawnCellValid({ x, y, boundary, occupiedCells, heightMap })) {
+      return { x, y };
+    }
+  }
+
+  for (let y = boundary.minY; y <= boundary.maxY; y += 1) {
+    for (let x = boundary.minX; x <= boundary.maxX; x += 1) {
+      if (isSpawnCellValid({ x, y, boundary, occupiedCells, heightMap })) {
+        return { x, y };
+      }
+    }
+  }
+
+  return {
+    x: clamp(anchorX, boundary.minX, boundary.maxX),
+    y: clamp(anchorY, boundary.minY, boundary.maxY),
+  };
+};
+
 export const calcUnitStats = (unitData) => {
   const job = JOBS[unitData.job];
   let stats = {
@@ -21,7 +101,7 @@ export const calcUnitStats = (unitData) => {
   return stats;
 };
 
-export const createCombatState = ({ playerData, enemyEnt, actualPlayerPos, worldSize = WORLD_SIZE }) => {
+export const createCombatState = ({ playerData, enemyEnt, actualPlayerPos, heightMap = null, worldSize = WORLD_SIZE }) => {
   const px = actualPlayerPos.x;
   const py = actualPlayerPos.y;
   const ex = enemyEnt.x;
@@ -36,21 +116,26 @@ export const createCombatState = ({ playerData, enemyEnt, actualPlayerPos, world
   };
 
   const combatUnits = [];
-  const playerPositions = [
-    { x: px, y: py },
-    { x: px - 1, y: py },
-    { x: px, y: py - 1 },
-  ];
+  const occupiedCells = new Set();
 
   playerData.party.forEach((partyMember, index) => {
     const stats = calcUnitStats(partyMember);
-    const spawn = playerPositions[index];
+    const formationOffset = PLAYER_FORMATION[index] ?? { x: 0, y: 0 };
+    const spawn = findSpawnCell({
+      anchorX: px + formationOffset.x,
+      anchorY: py + formationOffset.y,
+      boundary,
+      occupiedCells,
+      heightMap,
+    });
+    occupiedCells.add(getCellKey(spawn.x, spawn.y));
+
     combatUnits.push({
       ...partyMember,
       uid: `u_p_${index}`,
       team: 'player',
-      x: Math.max(boundary.minX, Math.min(boundary.maxX, spawn.x)),
-      y: Math.max(boundary.minY, Math.min(boundary.maxY, spawn.y)),
+      x: spawn.x,
+      y: spawn.y,
       hasMoved: false,
       hasActed: false,
       ...stats,
@@ -67,12 +152,22 @@ export const createCombatState = ({ playerData, enemyEnt, actualPlayerPos, world
       enchantSlots: [],
     };
     const stats = calcUnitStats(enemyData);
+    const formationOffset = ENEMY_FORMATION[index] ?? { x: 0, y: 0 };
+    const spawn = findSpawnCell({
+      anchorX: ex + formationOffset.x,
+      anchorY: ey + formationOffset.y,
+      boundary,
+      occupiedCells,
+      heightMap,
+    });
+    occupiedCells.add(getCellKey(spawn.x, spawn.y));
+
     combatUnits.push({
       ...enemyData,
       uid: `u_e_${index}`,
       team: 'enemy',
-      x: Math.max(boundary.minX, Math.min(boundary.maxX, ex + Math.floor(Math.random() * 3) - 1)),
-      y: Math.max(boundary.minY, Math.min(boundary.maxY, ey + Math.floor(Math.random() * 3) - 1)),
+      x: spawn.x,
+      y: spawn.y,
       hp: stats.maxHp,
       hasMoved: false,
       hasActed: false,
