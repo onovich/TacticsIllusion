@@ -18,10 +18,85 @@ const CAMERA_FOLLOW_DAMPING = 10;
 const COMBAT_FADE_DISTANCE = 6;
 const COMBAT_DIMMED_ENTITY_ALPHA = 0.45;
 const COMBAT_ENTITY_FILTER = 'grayscale(1) saturate(0.15) brightness(0.9)';
+const ENEMY_ACTION_INTERVAL = 1400;
+const HIT_REACTION_DURATION = 360;
+const BLOOD_PARTICLE_DURATION = 520;
+const ATTACK_PROFILES = {
+  melee: { windupMs: 180, travelMs: 160, settleMs: 220, backstepDistance: 0.18, lungeDistance: 0.42, arcHeight: 0.7, accent: '#f59e0b' },
+  arrow: { windupMs: 240, travelMs: 340, settleMs: 160, backstepDistance: 0.14, lungeDistance: 0.1, arcHeight: 2.2, accent: '#fbbf24' },
+  spell: { windupMs: 320, travelMs: 260, settleMs: 200, backstepDistance: 0.1, lungeDistance: 0.08, arcHeight: 1.6, accent: '#c084fc' },
+};
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
 const easeOutCubic = (value) => 1 - ((1 - value) ** 3);
+
+const easeInOutCubic = (value) => (value < 0.5 ? 4 * value ** 3 : 1 - ((-2 * value + 2) ** 3) / 2);
+
+const easeOutBack = (value) => {
+  const c1 = 1.70158;
+  const c3 = c1 + 1;
+
+  return 1 + c3 * ((value - 1) ** 3) + c1 * ((value - 1) ** 2);
+};
+
+const lerp = (from, to, progress) => from + (to - from) * progress;
+
+const normalizeVector = (dx, dy) => {
+  const length = Math.hypot(dx, dy) || 1;
+
+  return {
+    x: dx / length,
+    y: dy / length,
+    length,
+  };
+};
+
+const getAttackStyle = (unit) => {
+  if (unit.job === 'Archer') {
+    return 'arrow';
+  }
+
+  if (unit.job === 'Mage') {
+    return 'spell';
+  }
+
+  return 'melee';
+};
+
+const getAttackTargetCenter = (targets, fallbackCell) => {
+  const points = targets.length > 0
+    ? targets.map((target) => ({ x: target.x + 0.5, y: target.y + 0.5 }))
+    : [{ x: fallbackCell.x + 0.5, y: fallbackCell.y + 0.5 }];
+  const total = points.reduce((acc, point) => ({ x: acc.x + point.x, y: acc.y + point.y }), { x: 0, y: 0 });
+
+  return {
+    x: total.x / points.length,
+    y: total.y / points.length,
+  };
+};
+
+const createBloodParticles = (direction, count = 12) => Array.from({ length: count }, (_, index) => {
+  const spread = (Math.random() - 0.5) * 1.2;
+  const baseSpeed = 0.18 + Math.random() * 0.22;
+
+  return {
+    xBias: direction.x * 0.08,
+    yBias: direction.y * 0.08,
+    vx: direction.x * baseSpeed + spread * 0.22,
+    vy: direction.y * baseSpeed + spread * 0.22,
+    lift: 0.4 + Math.random() * 0.9,
+    size: 2.4 + (index % 3) + Math.random() * 1.4,
+  };
+});
+
+const syncSelectedUnitFromUnits = (selectedUnit, units) => {
+  if (!selectedUnit) {
+    return null;
+  }
+
+  return units.find((unit) => unit.uid === selectedUnit.uid) ?? null;
+};
 
 const createTimedTween = (from, to, duration = MOVE_TWEEN_DURATION, startedAt = performance.now()) => ({
   fromX: from.x,
@@ -181,6 +256,9 @@ export default function TacticsIllusionScreen() {
   const floatingTextsRef = useRef([]);
   const renderablesRef = useRef([]); 
   const motionTweensRef = useRef({});
+  const combatEffectsRef = useRef([]);
+  const combatBusyRef = useRef(false);
+  const effectIdRef = useRef(0);
   const cameraTweenRef = useRef(null);
   const previousFrameTimeRef = useRef(0);
   const stateRef = useLatestRef({ mode, playerData, entities, combatState, exploreState });
@@ -191,6 +269,13 @@ export default function TacticsIllusionScreen() {
     cameraRef.current.x = cameraPos.x;
     cameraRef.current.y = cameraPos.y;
   }, []);
+
+  useEffect(() => {
+    if (mode !== 'COMBAT') {
+      combatBusyRef.current = false;
+      combatEffectsRef.current = [];
+    }
+  }, [mode]);
 
   const tweenCameraTo = (targetPosition, duration = CAMERA_TWEEN_DURATION) => {
     cameraTweenRef.current = createTimedTween(
@@ -266,6 +351,8 @@ export default function TacticsIllusionScreen() {
       worldSize: WORLD_SIZE,
     });
 
+    combatBusyRef.current = false;
+    combatEffectsRef.current = [];
     setCombatState(nextCombatState);
     setMode('COMBAT');
     tweenCameraTo(getCameraFocusPosition(worldMap, centerX, centerY, COMBAT_CAMERA_Y_OFFSET));
@@ -274,45 +361,503 @@ export default function TacticsIllusionScreen() {
 
   const showFloatText = (x, y, text, color) => floatingTextsRef.current.push({ id: Date.now()+Math.random(), x, y, text, color, life: 60 });
 
-  const executeAttack = (targetX, targetY) => {
-    const cState = stateRef.current.combatState;
-    const attacker = cState.selectedUnit;
-    const isAoe = JOBS[attacker.job].aoe;
-    let targets = [];
-    if (isAoe) {
-      [{dx:0,dy:0}, {dx:1,dy:0}, {dx:-1,dy:0}, {dx:0,dy:1}, {dx:0,dy:-1}].forEach(off => {
-        const u = getCombatUnitAt(cState.units, targetX + off.dx, targetY + off.dy);
-        if (u && u.team !== attacker.team) targets.push(u);
-      });
-    } else {
-      const u = getCombatUnitAt(cState.units, targetX, targetY);
-      if (u && u.team !== attacker.team) targets.push(u);
+  const createEffectId = () => {
+    effectIdRef.current += 1;
+    return effectIdRef.current;
+  };
+
+  const pushCombatEffect = (effect) => {
+    combatEffectsRef.current.push({ id: createEffectId(), ...effect });
+  };
+
+  const collectAttackTargets = (units, attacker, targetX, targetY) => {
+    const offsets = JOBS[attacker.job].aoe
+      ? [{ dx: 0, dy: 0 }, { dx: 1, dy: 0 }, { dx: -1, dy: 0 }, { dx: 0, dy: 1 }, { dx: 0, dy: -1 }]
+      : [{ dx: 0, dy: 0 }];
+
+    return offsets.reduce((targets, offset) => {
+      const unit = getCombatUnitAt(units, targetX + offset.dx, targetY + offset.dy);
+      if (unit && unit.team !== attacker.team && !targets.find((target) => target.uid === unit.uid)) {
+        targets.push(unit);
+      }
+      return targets;
+    }, []);
+  };
+
+  const queueHitEffects = (target, attacker, startedAt = performance.now()) => {
+    const direction = normalizeVector(target.x - attacker.x, target.y - attacker.y);
+
+    pushCombatEffect({
+      kind: 'hit',
+      targetUid: target.uid,
+      startedAt,
+      endAt: startedAt + HIT_REACTION_DURATION,
+      direction,
+      origin: { x: target.x + 0.5, y: target.y + 0.5 },
+    });
+    pushCombatEffect({
+      kind: 'blood',
+      startedAt,
+      endAt: startedAt + BLOOD_PARTICLE_DURATION,
+      origin: { x: target.x + 0.5, y: target.y + 0.5 },
+      direction,
+      particles: createBloodParticles(direction),
+    });
+  };
+
+  const buildAttackEffect = (attacker, targets, targetCell, startedAt = performance.now()) => {
+    const style = getAttackStyle(attacker);
+    const profile = ATTACK_PROFILES[style];
+    const source = { x: attacker.x + 0.5, y: attacker.y + 0.5 };
+    const impact = getAttackTargetCenter(targets, targetCell);
+    const direction = normalizeVector(impact.x - source.x, impact.y - source.y);
+    const travelMs = style === 'melee' ? profile.travelMs : profile.travelMs + Math.round(direction.length * 45);
+    const impactAt = startedAt + profile.windupMs + travelMs;
+
+    return {
+      kind: 'attack',
+      style,
+      attackerUid: attacker.uid,
+      attackerTeam: attacker.team,
+      color: style === 'spell' ? JOBS[attacker.job].color : profile.accent,
+      source,
+      impact,
+      direction,
+      startedAt,
+      windupMs: profile.windupMs,
+      travelMs,
+      settleMs: profile.settleMs,
+      impactAt,
+      endAt: impactAt + profile.settleMs,
+      backstepDistance: profile.backstepDistance,
+      lungeDistance: profile.lungeDistance,
+      arcHeight: profile.arcHeight,
+      targetUids: targets.map((target) => target.uid),
+    };
+  };
+
+  const calculateDamage = (attacker, target) => {
+    const attackerZ = getCellZ(worldMap, attacker.x, attacker.y);
+    const targetZ = getCellZ(worldMap, target.x, target.y);
+    let damage = attacker.atk;
+
+    if (attacker.job === 'Archer' && attackerZ > targetZ) {
+      damage += Math.floor((attackerZ - targetZ) * 6);
     }
 
-    if (targets.length === 0) { setCombatState(prev => ({...prev, actionState: 'idle', hlCells: []})); return; }
-    const attackerZ = getCellZ(worldMap, attacker.x, attacker.y);
+    return Math.floor(damage * (0.85 + Math.random() * 0.3));
+  };
 
-    setCombatState(prev => {
-      const newUnits = prev.units.map(u => {
-        const isTarget = targets.find(t => t.uid === u.uid);
-        if (isTarget) {
-          const targetZ = getCellZ(worldMap, u.x, u.y);
-          let dmg = attacker.atk;
-          if (attacker.job === 'Archer' && attackerZ > targetZ) dmg += Math.floor((attackerZ - targetZ) * 6); 
-          dmg = Math.floor(dmg * (0.85 + Math.random() * 0.3));
-          showFloatText(u.x, u.y, `-${dmg}`, '#ef4444');
-          return { ...u, hp: Math.max(0, u.hp - dmg) };
-        }
-        if (u.uid === attacker.uid) return { ...u, hasActed: true };
-        return u;
-      });
-      return { ...prev, units: newUnits, actionState: 'idle', hlCells: [] };
+  const startAttackSequence = ({ attackerUid, targetCell, targetUids = null }) => {
+    const cState = stateRef.current.combatState;
+    if (!cState) {
+      return 0;
+    }
+
+    const attacker = cState.units.find((unit) => unit.uid === attackerUid && unit.hp > 0);
+    if (!attacker) {
+      return 0;
+    }
+
+    const targets = targetUids
+      ? cState.units.filter((unit) => targetUids.includes(unit.uid) && unit.hp > 0 && unit.team !== attacker.team)
+      : collectAttackTargets(cState.units, attacker, targetCell.x, targetCell.y);
+
+    if (targets.length === 0) {
+      setCombatState((prev) => (prev ? { ...prev, actionState: 'idle', hlCells: [] } : prev));
+      return 0;
+    }
+
+    const startedAt = performance.now();
+    const effect = buildAttackEffect(attacker, targets, targetCell, startedAt);
+    const targetSet = new Set(effect.targetUids);
+    const impactDelay = effect.impactAt - startedAt;
+    const totalDelay = effect.endAt - startedAt + 60;
+
+    combatBusyRef.current = true;
+    pushCombatEffect(effect);
+
+    setCombatState((prev) => {
+      if (!prev) {
+        return prev;
+      }
+
+      const nextUnits = prev.units.map((unit) => (unit.uid === attackerUid ? { ...unit, hasActed: true } : unit));
+      return {
+        ...prev,
+        units: nextUnits,
+        selectedUnit: syncSelectedUnitFromUnits(prev.selectedUnit, nextUnits),
+        actionState: 'idle',
+        hlCells: [],
+        isResolving: true,
+      };
     });
-    setTimeout(() => checkBattleResult(), 600);
+
+    window.setTimeout(() => {
+      if (!stateRef.current.combatState) {
+        combatBusyRef.current = false;
+        return;
+      }
+
+      const impactTime = performance.now();
+      setCombatState((prev) => {
+        if (!prev) {
+          return prev;
+        }
+
+        const actingUnit = prev.units.find((unit) => unit.uid === attackerUid && unit.hp > 0);
+        if (!actingUnit) {
+          return { ...prev, isResolving: false };
+        }
+
+        const nextUnits = prev.units.map((unit) => {
+          if (!targetSet.has(unit.uid) || unit.hp <= 0 || unit.team === actingUnit.team) {
+            return unit;
+          }
+
+          const damage = calculateDamage(actingUnit, unit);
+          showFloatText(unit.x, unit.y, `-${damage}`, '#ef4444');
+          queueHitEffects(unit, actingUnit, impactTime);
+          return { ...unit, hp: Math.max(0, unit.hp - damage) };
+        });
+
+        return {
+          ...prev,
+          units: nextUnits,
+          selectedUnit: syncSelectedUnitFromUnits(prev.selectedUnit, nextUnits),
+        };
+      });
+    }, impactDelay);
+
+    window.setTimeout(() => {
+      combatBusyRef.current = false;
+      if (!stateRef.current.combatState) {
+        return;
+      }
+
+      setCombatState((prev) => (prev ? {
+        ...prev,
+        isResolving: false,
+        selectedUnit: syncSelectedUnitFromUnits(prev.selectedUnit, prev.units),
+      } : prev));
+      checkBattleResult();
+    }, totalDelay);
+
+    return totalDelay;
+  };
+
+  const executeAttack = (targetX, targetY) => {
+    const cState = stateRef.current.combatState;
+    if (!cState || combatBusyRef.current) {
+      return;
+    }
+
+    const attacker = cState.selectedUnit;
+    if (!attacker) {
+      return;
+    }
+
+    const targets = collectAttackTargets(cState.units, attacker, targetX, targetY);
+
+    if (targets.length === 0) {
+      setCombatState((prev) => (prev ? { ...prev, actionState: 'idle', hlCells: [] } : prev));
+      return;
+    }
+
+    startAttackSequence({
+      attackerUid: attacker.uid,
+      targetCell: { x: targetX, y: targetY },
+      targetUids: targets.map((target) => target.uid),
+    });
+  };
+
+  const getCombatUnitPose = (unit, now) => {
+    const pose = {
+      gridOffsetX: 0,
+      gridOffsetY: 0,
+      liftY: 0,
+      jitterX: 0,
+      jitterY: 0,
+      scaleX: 1,
+      scaleY: 1,
+      tilt: 0,
+      flashAlpha: 0,
+      auraAlpha: 0,
+      auraColor: null,
+      shadowScale: 1,
+    };
+
+    combatEffectsRef.current.forEach((effect) => {
+      if (effect.kind === 'attack' && effect.attackerUid === unit.uid) {
+        const elapsed = now - effect.startedAt;
+        const recoverStart = effect.windupMs + effect.travelMs;
+        const totalDuration = effect.endAt - effect.startedAt;
+
+        if (elapsed < 0 || elapsed > totalDuration) {
+          return;
+        }
+
+        if (elapsed <= effect.windupMs) {
+          const progress = clamp(elapsed / effect.windupMs, 0, 1);
+          const backstep = lerp(0, effect.backstepDistance, easeInOutCubic(progress));
+          pose.gridOffsetX -= effect.direction.x * backstep;
+          pose.gridOffsetY -= effect.direction.y * backstep;
+          pose.liftY += Math.sin(progress * Math.PI) * (effect.style === 'spell' ? 8 : 4);
+          pose.scaleX += 0.04 * progress;
+          pose.scaleY -= 0.05 * progress;
+          pose.tilt += (effect.direction.x - effect.direction.y) * 0.04 * progress;
+          if (effect.style === 'spell') {
+            pose.auraAlpha = Math.max(pose.auraAlpha, 0.2 + 0.35 * progress);
+            pose.auraColor = effect.color;
+          }
+          return;
+        }
+
+        if (elapsed <= recoverStart) {
+          const progress = clamp((elapsed - effect.windupMs) / effect.travelMs, 0, 1);
+          const lunge = lerp(-effect.backstepDistance, effect.lungeDistance, easeOutBack(progress));
+          pose.gridOffsetX += effect.direction.x * lunge;
+          pose.gridOffsetY += effect.direction.y * lunge;
+          pose.liftY += Math.sin(progress * Math.PI) * (effect.style === 'melee' ? 10 : 4);
+          pose.tilt += (effect.direction.x - effect.direction.y) * (effect.style === 'melee' ? 0.1 : 0.05) * (1 - progress);
+          if (effect.style === 'spell') {
+            pose.auraAlpha = Math.max(pose.auraAlpha, 0.3 * (1 - progress));
+            pose.auraColor = effect.color;
+          }
+          return;
+        }
+
+        const progress = clamp((elapsed - recoverStart) / effect.settleMs, 0, 1);
+        const recoil = lerp(effect.style === 'melee' ? effect.lungeDistance : effect.lungeDistance * 0.4, 0, easeOutCubic(progress));
+        pose.gridOffsetX += effect.direction.x * recoil;
+        pose.gridOffsetY += effect.direction.y * recoil;
+        pose.liftY += Math.sin((1 - progress) * Math.PI) * (effect.style === 'melee' ? 4 : 2);
+        if (effect.style === 'spell') {
+          pose.auraAlpha = Math.max(pose.auraAlpha, 0.15 * (1 - progress));
+          pose.auraColor = effect.color;
+        }
+      }
+
+      if (effect.kind === 'hit' && effect.targetUid === unit.uid) {
+        const duration = effect.endAt - effect.startedAt;
+        const progress = clamp((now - effect.startedAt) / duration, 0, 1);
+        if (progress < 0 || progress > 1) {
+          return;
+        }
+
+        const shock = Math.sin(progress * Math.PI * 8) * (1 - progress) * 4;
+        pose.jitterX += effect.direction.x * shock + effect.direction.y * shock * 0.45;
+        pose.jitterY += effect.direction.y * shock - effect.direction.x * shock * 0.45;
+        pose.flashAlpha = Math.max(pose.flashAlpha, ((1 - progress) ** 1.2) * 0.55);
+        pose.scaleX += 0.05 * (1 - progress);
+        pose.scaleY -= 0.06 * (1 - progress);
+        pose.shadowScale += 0.05 * (1 - progress);
+      }
+    });
+
+    pose.shadowScale = clamp(pose.shadowScale, 0.78, 1.4);
+    return pose;
+  };
+
+  const renderCombatEffects = (ctx, now) => {
+    combatEffectsRef.current.forEach((effect) => {
+      if (effect.kind === 'attack') {
+        if (effect.style === 'melee') {
+          const progress = clamp((now - (effect.startedAt + effect.windupMs * 0.6)) / Math.max(effect.travelMs, 1), 0, 1);
+          if (progress > 0 && progress < 1) {
+            const impactZ = getAnimatedCellZ(worldMap, effect.impact.x, effect.impact.y);
+            const impactPos = toIso(effect.impact.x, effect.impact.y, impactZ);
+            const screenDir = toIso(effect.impact.x + effect.direction.x * 0.2, effect.impact.y + effect.direction.y * 0.2, impactZ);
+            const angle = Math.atan2(screenDir.cy - impactPos.cy, screenDir.cx - impactPos.cx);
+
+            ctx.save();
+            ctx.translate(impactPos.cx, impactPos.cy - 18);
+            ctx.rotate(angle);
+            ctx.globalAlpha = 0.18 + (1 - progress) * 0.45;
+            ctx.strokeStyle = effect.color;
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.arc(0, 0, 15 + progress * 12, -1.3, 0.55);
+            ctx.stroke();
+            ctx.restore();
+          }
+        }
+
+        if (effect.style === 'arrow') {
+          const releaseAt = effect.startedAt + effect.windupMs * 0.55;
+          const travelProgress = clamp((now - releaseAt) / Math.max(effect.impactAt - releaseAt, 1), 0, 1);
+          if (travelProgress > 0 && travelProgress < 1) {
+            const projectileX = lerp(effect.source.x, effect.impact.x, travelProgress);
+            const projectileY = lerp(effect.source.y, effect.impact.y, travelProgress);
+            const nextProgress = clamp(travelProgress + 0.02, 0, 1);
+            const nextX = lerp(effect.source.x, effect.impact.x, nextProgress);
+            const nextY = lerp(effect.source.y, effect.impact.y, nextProgress);
+            const groundZ = getAnimatedCellZ(worldMap, projectileX, projectileY);
+            const nextGroundZ = getAnimatedCellZ(worldMap, nextX, nextY);
+            const arc = effect.arcHeight * 4 * travelProgress * (1 - travelProgress);
+            const nextArc = effect.arcHeight * 4 * nextProgress * (1 - nextProgress);
+            const projectilePos = toIso(projectileX, projectileY, groundZ + arc);
+            const nextPos = toIso(nextX, nextY, nextGroundZ + nextArc);
+            const sourceGround = getAnimatedCellZ(worldMap, effect.source.x, effect.source.y);
+            const sourcePos = toIso(effect.source.x, effect.source.y, sourceGround);
+            const angle = Math.atan2(nextPos.cy - projectilePos.cy, nextPos.cx - projectilePos.cx);
+
+            ctx.save();
+            ctx.globalAlpha = 0.2;
+            ctx.strokeStyle = 'rgba(251,191,36,0.55)';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.moveTo(sourcePos.cx, sourcePos.cy - 10);
+            ctx.lineTo(projectilePos.cx, projectilePos.cy - 6);
+            ctx.stroke();
+            ctx.restore();
+
+            ctx.save();
+            ctx.translate(projectilePos.cx, projectilePos.cy - 8);
+            ctx.rotate(angle);
+            ctx.strokeStyle = '#fef3c7';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(-10, 0);
+            ctx.lineTo(6, 0);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(3, -4);
+            ctx.lineTo(8, 0);
+            ctx.lineTo(3, 4);
+            ctx.stroke();
+            ctx.restore();
+          }
+        }
+
+        if (effect.style === 'spell') {
+          const casterZ = getAnimatedCellZ(worldMap, effect.source.x, effect.source.y);
+          const casterPos = toIso(effect.source.x, effect.source.y, casterZ);
+          const windupProgress = clamp((now - effect.startedAt) / Math.max(effect.windupMs, 1), 0, 1);
+          const travelProgress = clamp((now - (effect.startedAt + effect.windupMs * 0.55)) / Math.max(effect.impactAt - (effect.startedAt + effect.windupMs * 0.55), 1), 0, 1);
+          const impactProgress = clamp((now - effect.impactAt) / Math.max(effect.settleMs, 1), 0, 1);
+
+          if (windupProgress > 0 && windupProgress < 1) {
+            for (let index = 0; index < 6; index += 1) {
+              const angle = windupProgress * Math.PI * 2.6 + index * ((Math.PI * 2) / 6);
+              const radius = 10 + windupProgress * 12;
+              const x = casterPos.cx + Math.cos(angle) * radius;
+              const y = casterPos.cy - 18 + Math.sin(angle) * radius * 0.55;
+
+              ctx.save();
+              ctx.globalAlpha = 0.18 + windupProgress * 0.35;
+              ctx.fillStyle = index % 2 === 0 ? effect.color : '#f8fafc';
+              ctx.beginPath();
+              ctx.arc(x, y, 2.6 + windupProgress * 1.2, 0, Math.PI * 2);
+              ctx.fill();
+              ctx.restore();
+            }
+          }
+
+          if (travelProgress > 0 && travelProgress < 1) {
+            for (let index = 0; index < 5; index += 1) {
+              const beadProgress = clamp(travelProgress - index * 0.08, 0, 1);
+              if (beadProgress <= 0 || beadProgress >= 1) {
+                continue;
+              }
+
+              const beadX = lerp(effect.source.x, effect.impact.x, beadProgress);
+              const beadY = lerp(effect.source.y, effect.impact.y, beadProgress);
+              const beadZ = getAnimatedCellZ(worldMap, beadX, beadY);
+              const wobble = Math.sin(beadProgress * Math.PI * 4 + index) * 0.18;
+              const beadPos = toIso(beadX - effect.direction.y * wobble, beadY + effect.direction.x * wobble, beadZ + effect.arcHeight * 0.7);
+
+              ctx.save();
+              ctx.globalAlpha = 0.12 + (1 - beadProgress) * 0.45;
+              ctx.fillStyle = index % 2 === 0 ? effect.color : '#e9d5ff';
+              ctx.beginPath();
+              ctx.arc(beadPos.cx, beadPos.cy - 12, 4 - index * 0.45, 0, Math.PI * 2);
+              ctx.fill();
+              ctx.restore();
+            }
+          }
+
+          if (impactProgress > 0 && impactProgress < 1) {
+            const impactZ = getAnimatedCellZ(worldMap, effect.impact.x, effect.impact.y);
+            const impactPos = toIso(effect.impact.x, effect.impact.y, impactZ + 0.8 * (1 - impactProgress));
+
+            ctx.save();
+            ctx.translate(impactPos.cx, impactPos.cy - 16);
+            ctx.globalAlpha = 0.45 * (1 - impactProgress);
+            ctx.strokeStyle = effect.color;
+            ctx.lineWidth = 2.5;
+            ctx.beginPath();
+            ctx.arc(0, 0, 12 + impactProgress * 18, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.restore();
+
+            for (let index = 0; index < 6; index += 1) {
+              const angle = index * ((Math.PI * 2) / 6) + impactProgress * 1.8;
+              const radius = 6 + impactProgress * 16;
+              const x = impactPos.cx + Math.cos(angle) * radius;
+              const y = impactPos.cy - 16 + Math.sin(angle) * radius * 0.65;
+
+              ctx.save();
+              ctx.globalAlpha = 0.2 + (1 - impactProgress) * 0.35;
+              ctx.fillStyle = index % 2 === 0 ? effect.color : '#f8fafc';
+              ctx.beginPath();
+              ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+              ctx.fill();
+              ctx.restore();
+            }
+          }
+        }
+      }
+
+      if (effect.kind === 'hit') {
+        const duration = effect.endAt - effect.startedAt;
+        const progress = clamp((now - effect.startedAt) / duration, 0, 1);
+        if (progress > 0 && progress < 1) {
+          const impactZ = getAnimatedCellZ(worldMap, effect.origin.x, effect.origin.y);
+          const impactPos = toIso(effect.origin.x, effect.origin.y, impactZ);
+
+          ctx.save();
+          ctx.translate(impactPos.cx, impactPos.cy - 18);
+          ctx.globalAlpha = 0.22 + (1 - progress) * 0.25;
+          ctx.strokeStyle = '#f87171';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(0, 0, 12 + progress * 18, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+
+      if (effect.kind === 'blood') {
+        const duration = effect.endAt - effect.startedAt;
+        const progress = clamp((now - effect.startedAt) / duration, 0, 1);
+        if (progress > 0 && progress < 1) {
+          effect.particles.forEach((particle, index) => {
+            const worldX = effect.origin.x + particle.xBias + particle.vx * progress * 4;
+            const worldY = effect.origin.y + particle.yBias + particle.vy * progress * 4;
+            const baseZ = getAnimatedCellZ(worldMap, worldX, worldY);
+            const lift = particle.lift * Math.sin(progress * Math.PI);
+            const point = toIso(worldX, worldY, baseZ + lift);
+
+            ctx.save();
+            ctx.globalAlpha = ((1 - progress) ** 1.4) * (0.3 + (index % 4) * 0.1);
+            ctx.fillStyle = index % 3 === 0 ? '#7f1d1d' : '#ef4444';
+            ctx.beginPath();
+            ctx.arc(point.cx, point.cy - 8, particle.size * (1 - progress * 0.35), 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+          });
+        }
+      }
+    });
   };
 
   const checkBattleResult = () => {
     const cState = stateRef.current.combatState;
+    if (!cState) {
+      return;
+    }
+
     const playerAlive = cState.units.filter(u => u.team === 'player' && u.hp > 0).length > 0;
     const enemyAlive = cState.units.filter(u => u.team === 'enemy' && u.hp > 0).length > 0;
 
@@ -368,9 +913,13 @@ export default function TacticsIllusionScreen() {
   useEffect(() => {
     if (mode === 'COMBAT' && combatState?.turn === 'enemy') {
       let delay = 800;
-      combatState.units.filter(u => u.team === 'enemy' && u.hp > 0).forEach((enemy, idx) => {
+      combatState.units.filter(u => u.team === 'enemy' && u.hp > 0).forEach((enemy) => {
         setTimeout(() => {
           const currentState = stateRef.current.combatState;
+          if (!currentState || currentState.turn !== 'enemy') {
+            return;
+          }
+
           const currentEnemy = currentState?.units.find(u => u.uid === enemy.uid);
           if (!currentEnemy || currentEnemy.hp <= 0) {
             setTimeout(() => checkBattleResult(), 0);
@@ -398,28 +947,46 @@ export default function TacticsIllusionScreen() {
           }));
 
           setTimeout(() => {
-            setCombatState(currState => {
-              const updatedEnemy = currState.units.find(u => u.uid === enemy.uid);
-              if (!updatedEnemy || updatedEnemy.hp <= 0) {
+            const latestState = stateRef.current.combatState;
+            if (!latestState || latestState.turn !== 'enemy') {
+              return;
+            }
+
+            const updatedEnemy = latestState.units.find((unit) => unit.uid === enemy.uid && unit.hp > 0);
+            if (!updatedEnemy) {
+              setTimeout(() => checkBattleResult(), 0);
+              return;
+            }
+
+            const target = latestState.units.find(
+              (unit) => unit.team === 'player' && unit.hp > 0 && Math.abs(unit.x - updatedEnemy.x) + Math.abs(unit.y - updatedEnemy.y) <= updatedEnemy.range,
+            );
+
+            if (target) {
+              startAttackSequence({
+                attackerUid: updatedEnemy.uid,
+                targetCell: { x: target.x, y: target.y },
+                targetUids: collectAttackTargets(latestState.units, updatedEnemy, target.x, target.y).map((unit) => unit.uid),
+              });
+              return;
+            }
+
+            setCombatState((currState) => {
+              if (!currState) {
                 return currState;
               }
 
-              let newUnits = [...currState.units];
-              for (const tgt of newUnits) {
-                if (tgt.team === 'player' && tgt.hp > 0 && Math.abs(tgt.x - updatedEnemy.x) + Math.abs(tgt.y - updatedEnemy.y) <= updatedEnemy.range) {
-                  const dmg = Math.floor(updatedEnemy.atk * (0.8 + Math.random() * 0.4));
-                  showFloatText(tgt.x, tgt.y, `-${dmg}`, '#ef4444');
-                  newUnits = newUnits.map(u => u.uid === tgt.uid ? { ...u, hp: Math.max(0, u.hp - dmg) } : u);
-                  break;
-                }
-              }
-
-              newUnits = newUnits.map(u => u.uid === updatedEnemy.uid ? { ...u, hasActed: true } : u);
-              return { ...currState, units: newUnits };
+              const nextUnits = currState.units.map((unit) => (unit.uid === enemy.uid ? { ...unit, hasActed: true } : unit));
+              return {
+                ...currState,
+                units: nextUnits,
+                selectedUnit: syncSelectedUnitFromUnits(currState.selectedUnit, nextUnits),
+              };
             });
-            setTimeout(() => checkBattleResult(), 400);
+            setTimeout(() => checkBattleResult(), 120);
           }, attackDelay);
-        }, delay * (idx + 1));
+        }, delay);
+        delay += ENEMY_ACTION_INTERVAL;
       });
     }
   }, [mode, combatState?.turn]);
@@ -463,6 +1030,7 @@ export default function TacticsIllusionScreen() {
   const handleGridClick = (screenX, screenY) => {
     const st = stateRef.current;
     if (st.mode !== 'EXPLORE' && st.mode !== 'COMBAT') return;
+    if (st.mode === 'COMBAT' && (combatBusyRef.current || st.combatState?.isResolving)) return;
 
     const canvas = canvasRef.current;
     if(!canvas) return;
@@ -477,6 +1045,30 @@ export default function TacticsIllusionScreen() {
     let clickedCell = null;
     const renderables = renderablesRef.current;
 
+    for (let i = renderables.length - 1; i >= 0; i--) {
+      const item = renderables[i];
+      if (item.type !== 'cell') {
+        continue;
+      }
+
+      const { x: gx, y: gy } = item;
+      const z0 = worldMap[gx][gy], z1 = worldMap[gx+1][gy], z2 = worldMap[gx+1][gy+1], z3 = worldMap[gx][gy+1];
+      const p0 = toIso(gx, gy, z0), p1 = toIso(gx+1, gy, z1), p2 = toIso(gx+1, gy+1, z2), p3 = toIso(gx, gy+1, z3);
+
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.beginPath();
+      ctx.moveTo(cx + p0.cx * zoom, cy + p0.cy * zoom);
+      ctx.lineTo(cx + p1.cx * zoom, cy + p1.cy * zoom);
+      ctx.lineTo(cx + p2.cx * zoom, cy + p2.cy * zoom);
+      ctx.lineTo(cx + p3.cx * zoom, cy + p3.cy * zoom);
+      ctx.closePath();
+      if (ctx.isPointInPath(x, y)) {
+        clickedCell = {x: item.x, y: item.y};
+        break;
+      }
+    }
+
+    if (!clickedCell) {
     // 完全不依赖 ctx.scale，直接用欧几里得距离与投影映射判定像素坐标 (极致精准)
     for (let i = renderables.length - 1; i >= 0; i--) {
       const item = renderables[i];
@@ -505,23 +1097,9 @@ export default function TacticsIllusionScreen() {
          if (Math.hypot(x - hitX, y - hitY) <= 35 * zoom) {
              clickedCell = {x: item.ent.x, y: item.ent.y}; break;
          }
-      } else if (item.type === 'cell') {
-         const { x: gx, y: gy } = item;
-         const z0 = worldMap[gx][gy], z1 = worldMap[gx+1][gy], z2 = worldMap[gx+1][gy+1], z3 = worldMap[gx][gy+1];
-         const p0 = toIso(gx, gy, z0), p1 = toIso(gx+1, gy, z1), p2 = toIso(gx+1, gy+1, z2), p3 = toIso(gx, gy+1, z3);
-         
-         ctx.setTransform(1, 0, 0, 1, 0, 0); // 重置矩阵保证运算一致性
-         ctx.beginPath();
-         ctx.moveTo(cx + p0.cx * zoom, cy + p0.cy * zoom);
-         ctx.lineTo(cx + p1.cx * zoom, cy + p1.cy * zoom);
-         ctx.lineTo(cx + p2.cx * zoom, cy + p2.cy * zoom);
-         ctx.lineTo(cx + p3.cx * zoom, cy + p3.cy * zoom);
-         ctx.closePath();
-         if (ctx.isPointInPath(x, y)) {
-             clickedCell = {x: item.x, y: item.y}; break;
-         }
       }
     }
+      }
 
     if(clickedCell) {
        if (st.mode === 'EXPLORE') handleExploreGridClick(clickedCell.x, clickedCell.y);
@@ -531,13 +1109,24 @@ export default function TacticsIllusionScreen() {
 
   const processCombatClick = (tx, ty) => {
       const st = stateRef.current; const cState = st.combatState;
+      if (!cState || combatBusyRef.current || cState.isResolving) return;
       const clickedUnit = getCombatUnitAt(cState.units, tx, ty);
       if (cState.actionState === 'moving') {
         if (cState.hlCells.find(c=>c.x===tx && c.y===ty)) {
-          setCombatState(p => ({
-            ...p, actionState:'idle', hlCells:[], selectedUnit: {...p.selectedUnit, x:tx, y:ty, hasMoved:true},
-            units: p.units.map(u => u.uid === p.selectedUnit.uid ? {...u, x:tx, y:ty, hasMoved:true} : u)
-          }));
+          setCombatState((p) => {
+            if (!p) {
+              return p;
+            }
+
+            const nextUnits = p.units.map((u) => (u.uid === p.selectedUnit.uid ? { ...u, x:tx, y:ty, hasMoved:true } : u));
+            return {
+              ...p,
+              actionState:'idle',
+              hlCells:[],
+              units: nextUnits,
+              selectedUnit: syncSelectedUnitFromUnits(p.selectedUnit, nextUnits),
+            };
+          });
           setTimeout(checkBattleResult, 100);
         } else setCombatState(p=>({...p, actionState:'idle', hlCells:[]}));
         return;
@@ -552,10 +1141,17 @@ export default function TacticsIllusionScreen() {
   };
 
   const clearCombatSelection = () => {
+    if (combatBusyRef.current || stateRef.current.combatState?.isResolving) {
+      return;
+    }
     setCombatState((prev) => ({ ...prev, selectedUnit: null, actionState: 'idle', hlCells: [] }));
   };
 
   const toggleCombatMovement = () => {
+    if (combatBusyRef.current) {
+      return;
+    }
+
     setCombatState((prev) => ({
       ...prev,
       actionState: prev.actionState === 'moving' ? 'idle' : 'moving',
@@ -567,6 +1163,10 @@ export default function TacticsIllusionScreen() {
   };
 
   const toggleCombatAttack = () => {
+    if (combatBusyRef.current) {
+      return;
+    }
+
     setCombatState((prev) => ({
       ...prev,
       actionState: prev.actionState === 'attacking' ? 'idle' : 'attacking',
@@ -578,27 +1178,53 @@ export default function TacticsIllusionScreen() {
   };
 
   const usePotion = () => {
+    if (combatBusyRef.current) {
+      return;
+    }
+
+    const selectedUnit = stateRef.current.combatState?.selectedUnit;
     setPlayerData((prev) => ({ ...prev, potions: prev.potions - 1 }));
-    setCombatState((prev) => ({
-      ...prev,
-      actionState: 'idle',
-      hlCells: [],
-      units: prev.units.map((unit) =>
-        unit.uid === prev.selectedUnit.uid ? { ...unit, hp: Math.min(unit.maxHp, unit.hp + 50), hasActed: true } : unit,
-      ),
-    }));
-    showFloatText(combatState.selectedUnit.x, combatState.selectedUnit.y, '+50', '#4ade80');
+    setCombatState((prev) => {
+      if (!prev) {
+        return prev;
+      }
+
+      const nextUnits = prev.units.map((unit) => (
+        unit.uid === prev.selectedUnit.uid ? { ...unit, hp: Math.min(unit.maxHp, unit.hp + 50), hasActed: true } : unit
+      ));
+      return {
+        ...prev,
+        actionState: 'idle',
+        hlCells: [],
+        units: nextUnits,
+        selectedUnit: syncSelectedUnitFromUnits(prev.selectedUnit, nextUnits),
+      };
+    });
+    if (selectedUnit) {
+      showFloatText(selectedUnit.x, selectedUnit.y, '+50', '#4ade80');
+    }
     setTimeout(checkBattleResult, 100);
   };
 
   const standbySelectedUnit = () => {
-    setCombatState((prev) => ({
-      ...prev,
-      units: prev.units.map((unit) => (unit.uid === prev.selectedUnit.uid ? { ...unit, hasMoved: true, hasActed: true } : unit)),
-      selectedUnit: null,
-      actionState: 'idle',
-      hlCells: [],
-    }));
+    if (combatBusyRef.current) {
+      return;
+    }
+
+    setCombatState((prev) => {
+      if (!prev) {
+        return prev;
+      }
+
+      const nextUnits = prev.units.map((unit) => (unit.uid === prev.selectedUnit.uid ? { ...unit, hasMoved: true, hasActed: true } : unit));
+      return {
+        ...prev,
+        units: nextUnits,
+        selectedUnit: null,
+        actionState: 'idle',
+        hlCells: [],
+      };
+    });
     setTimeout(checkBattleResult, 100);
   };
 
@@ -693,7 +1319,8 @@ export default function TacticsIllusionScreen() {
           
           renderList.push({ type: 'cell', x, y, z: x+y, opacity: cellOpacity });
           const ent = st.entities.find(e => e.x === x && e.y === y);
-          if (ent && (!combatBoundary || ent.type !== 'enemy_patrol' || ent.id !== st.combatState.enemyEntId)) {
+          const isCurrentEncounterEntity = Boolean(st.mode === 'COMBAT' && st.combatState && ent && ent.id === st.combatState.enemyEntId);
+          if (ent && !isCurrentEncounterEntity) {
             const entityOpacity = combatBoundary ? cellOpacity * COMBAT_DIMMED_ENTITY_ALPHA : 1;
             if (entityOpacity > TWEEN_EPSILON) {
               renderList.push({ type: 'entity', ent, z: x+y+0.5, opacity: entityOpacity, dimmed: Boolean(combatBoundary) });
@@ -718,6 +1345,7 @@ export default function TacticsIllusionScreen() {
       }
 
       pruneTweenTargets(motionTweensRef.current, activeTweenKeys);
+      combatEffectsRef.current = combatEffectsRef.current.filter((effect) => effect.endAt > now);
 
       renderList.sort((a, b) => a.z - b.z);
       renderablesRef.current = renderList; 
@@ -823,15 +1451,39 @@ export default function TacticsIllusionScreen() {
         }
         else if (item.type === 'combat_unit') {
           const { unit } = item;
-          const z = getAnimatedCellZ(worldMap, item.displayPos.x, item.displayPos.y);
-          const pos = toIso(item.displayPos.x+0.5, item.displayPos.y+0.5, z);
           const job = JOBS[unit.job];
+          const pose = getCombatUnitPose(unit, now);
+          const animatedPos = {
+            x: item.displayPos.x + pose.gridOffsetX,
+            y: item.displayPos.y + pose.gridOffsetY,
+          };
+          const z = getAnimatedCellZ(worldMap, animatedPos.x, animatedPos.y);
+          const pos = toIso(animatedPos.x+0.5, animatedPos.y+0.5, z);
           
-          ctx.save(); ctx.translate(pos.cx, pos.cy - 12);
-          ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.beginPath(); ctx.ellipse(0, 12, 16, 8, 0, 0, Math.PI*2); ctx.fill();
+          ctx.save();
+          ctx.translate(pos.cx + pose.jitterX, pos.cy - 12 + pose.jitterY - pose.liftY);
+          ctx.rotate(pose.tilt);
+          ctx.scale(pose.scaleX, pose.scaleY);
+
+          if (pose.auraAlpha > 0) {
+            ctx.save();
+            ctx.globalAlpha = pose.auraAlpha;
+            ctx.strokeStyle = pose.auraColor ?? job.color;
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(0, -15, 24 + Math.sin(now / 80) * 2, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.restore();
+          }
+
+          ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.beginPath(); ctx.ellipse(0, 12, 16 * pose.shadowScale, 8 * pose.shadowScale, 0, 0, Math.PI*2); ctx.fill();
           ctx.fillStyle = 'white'; ctx.beginPath(); ctx.arc(0, -15, 20, 0, Math.PI*2); ctx.fill();
           ctx.fillStyle = (unit.hasMoved && unit.hasActed) ? '#64748b' : job.color;
           ctx.beginPath(); ctx.arc(0, -15, 16, 0, Math.PI*2); ctx.fill();
+          if (pose.flashAlpha > 0) {
+            ctx.fillStyle = `rgba(248, 113, 113, ${pose.flashAlpha})`;
+            ctx.beginPath(); ctx.arc(0, -15, 16, 0, Math.PI * 2); ctx.fill();
+          }
           ctx.fillStyle='white'; ctx.font='16px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(job.icon, 0, -15);
           
           ctx.fillStyle = unit.team === 'player' ? '#3b82f6' : '#ef4444';
@@ -850,6 +1502,8 @@ export default function TacticsIllusionScreen() {
           ctx.restore();
         }
       });
+
+      renderCombatEffects(ctx, now);
 
       floatingTextsRef.current.forEach(ft => {
         const cellZ = getCellZ(worldMap, ft.x, ft.y);

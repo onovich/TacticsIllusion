@@ -247,6 +247,7 @@ export const createCombatState = ({ playerData, enemyEnt, actualPlayerPos, heigh
     units: combatUnits,
     turn: 'player',
     selectedUnit: null,
+    isResolving: false,
     actionState: 'idle',
     hlCells: [],
   };
